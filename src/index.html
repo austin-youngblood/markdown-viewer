@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; img-src 'self' data: https: file:;">
+  <title>Markdown Viewer</title>
+  <link rel="stylesheet" href="../node_modules/highlight.js/styles/github-dark.css">
+  <link rel="stylesheet" href="../node_modules/katex/dist/katex.min.css">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="tab-bar"></div>
+  <div id="app">
+    <div id="editor-pane">
+      <div id="find-panel">
+        <div class="find-row">
+          <input id="find-input" type="text" placeholder="Find" spellcheck="false">
+          <button id="find-case" class="find-toggle" title="Match case">Aa</button>
+          <button id="find-word" class="find-toggle" title="Whole word">ab</button>
+          <button id="find-regex" class="find-toggle" title="Regex">.*</button>
+          <button id="find-in-selection" class="find-toggle" title="Search in selection">[ ]</button>
+          <span id="find-counter"></span>
+          <button id="find-prev" class="find-nav" title="Previous (Shift+Enter)">↑</button>
+          <button id="find-next" class="find-nav" title="Next (Enter)">↓</button>
+          <button id="find-close" class="find-nav" title="Close (Esc)">×</button>
+        </div>
+        <div class="find-row" id="find-replace-row">
+          <input id="replace-input" type="text" placeholder="Replace" spellcheck="false">
+          <button id="find-replace" class="find-nav" title="Replace">Replace</button>
+          <button id="find-replace-all" class="find-nav" title="Replace all">Replace all</button>
+        </div>
+      </div>
+      <div id="editor-body">
+        <div id="insert-toolbar">
+          <button class="toolbar-btn" data-template="Heading 1" title="Heading 1">H1</button>
+          <button class="toolbar-btn" data-template="Heading 2" title="Heading 2">H2</button>
+          <button class="toolbar-btn" data-template="Heading 3" title="Heading 3">H3</button>
+          <span class="toolbar-sep"></span>
+          <button class="toolbar-btn" data-template="Paragraph" title="Paragraph">¶</button>
+          <button class="toolbar-btn" data-template="Bulleted list" title="Bulleted list">•—</button>
+          <button class="toolbar-btn" data-template="Numbered list" title="Numbered list">1.</button>
+          <button class="toolbar-btn" data-template="Task list" title="Task list">☐</button>
+          <button class="toolbar-btn" data-template="Blockquote" title="Blockquote">❝</button>
+          <button class="toolbar-btn" data-template="Horizontal rule" title="Horizontal rule">━</button>
+          <span class="toolbar-sep"></span>
+          <button class="toolbar-btn" data-template="Code block" title="Code block">&lt;/&gt;</button>
+          <button class="toolbar-btn" data-template="Table" title="Table">▦</button>
+          <button class="toolbar-btn" data-template="Math (block)" title="Math block">∫</button>
+          <button class="toolbar-btn" data-template="Mermaid diagram" title="Mermaid diagram">◇</button>
+          <button class="toolbar-btn" data-template="Image" title="Image">🖼</button>
+        </div>
+        <div id="editor-wrap">
+          <div id="editor-highlight"></div>
+          <textarea id="editor" placeholder="# Open a file or start typing..." spellcheck="false"></textarea>
+        </div>
+      </div>
+    </div>
+    <div id="preview-pane">
+      <div id="preview-scroll">
+        <article id="preview" class="markdown-body"></article>
+      </div>
+    </div>
+  </div>
+  <div id="statusbar">
+    <span id="filepath">No file loaded</span>
+    <span id="update-indicator" class="hidden">
+      <span id="update-text"></span>
+      <button id="update-install" class="hidden" type="button">Install &amp; Restart</button>
+    </span>
+    <span id="status"></span>
+  </div>
+  <div id="popover-host"></div>
+  <div id="insert-menu-host"></div>
+  <script src="../node_modules/katex/dist/katex.min.js"></script>
+  <script src="../node_modules/katex/dist/contrib/auto-render.min.js"></script>
+  <script src="../node_modules/mermaid/dist/mermaid.min.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>
