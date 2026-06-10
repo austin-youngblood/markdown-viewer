@@ -772,30 +772,44 @@ body.reading-mode #preview .md-block { cursor: default; }
 
 /* ============================================================================
    LINE NUMBERS GUTTER
-   ============================================================================ */
+   ============================================================================
+   One <div class="editor-ln"> per source line, height set inline to match
+   the wrapped pixel height in the editor. The number anchors at the top
+   of each cell so wrapped lines show their number on the first visual row.
+   Padding-top matches the editor's padding so cell 1 starts at the same y
+   coordinate as the first character. */
 #editor-line-numbers {
   display: none;
   position: absolute;
   inset: 0 auto 0 0;
-  width: 44px;
-  padding: 16px 8px 16px 0;
+  width: 48px;
+  padding: 16px 0 16px 0;
   background: #1c1c1c;
   color: #555;
   font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace;
   font-size: 14px;
   line-height: 1.6;
-  text-align: right;
-  white-space: pre;
   overflow: hidden;
   border-right: 1px solid #333;
   pointer-events: none;
   user-select: none;
   z-index: 3;
 }
+.editor-ln {
+  text-align: right;
+  padding-right: 10px;
+}
 body.line-numbers #editor-line-numbers { display: block; }
 body.line-numbers #editor-highlight,
 body.line-numbers #editor {
-  padding-left: 56px;
+  padding-left: 60px;
+}
+
+/* The hidden measurer that powers per-line height detection. Off-screen,
+   no visual effect, but inherits font properties set in JS. */
+#editor-line-measurer .lm-row {
+  /* Each row participates in normal flow with the same line-height as the
+     editor (set via inline style in JS). */
 }
 
 /* ============================================================================

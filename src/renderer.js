@@ -276,8 +276,11 @@ function applyEdit(start, end, text) {
   editor.setSelectionRange(start, end);
   const ok = document.execCommand('insertText', false, text);
   if (!ok) {
-    // Fallback: undo will be lost but the edit still applies.
+    // Fallback: undo will be lost but the edit still applies. execCommand
+    // would have fired input → invalidated metrics; the fallback doesn't,
+    // so do it ourselves.
     editor.value = editor.value.slice(0, start) + text + editor.value.slice(end);
+    invalidateEditorLineMetrics();
   }
   // execCommand fires 'input' which would schedule a debounced render — we
   // call render() explicitly elsewhere, so cancel the pending timer here.
@@ -335,7 +338,7 @@ function renderWithBlocks(src) {
     // Strip trailing newline from source (we re-add on save)
     if (source.endsWith('\n')) source = source.slice(0, -1);
 
-    blockMap.push({ id: blockId, startChar, endChar, source });
+    blockMap.push({ id: blockId, startChar, endChar, source, startLine, endLine });
 
     const blockTokens = tokens.slice(i, endIdx + 1);
     const blockHtml = md.renderer.render(blockTokens, md.options, env);
@@ -1258,6 +1261,7 @@ editor.addEventListener('input', () => {
   clearTimeout(renderTimer);
   renderTimer = setTimeout(render, 150);
   markDirty();
+  invalidateEditorLineMetrics();
   updateLineNumbers();
   if (findState.open && findState.query) updateMatches();
 });
@@ -1525,11 +1529,98 @@ document.getElementById('home-open').addEventListener('click', () => {
 });
 
 // =========================================================================
+// EDITOR LINE-METRICS MEASURER
+// =========================================================================
+// Translates between source-line indices and pixel offsets in the editor.
+// The textarea uses pre-wrap, so a single source line can take 1+ visual
+// rows depending on width. Both the line-numbers gutter and scroll sync
+// need accurate per-line heights — the gutter to align numbers with the
+// FIRST visual row of each wrapped line, sync to map scrollTop to a
+// concrete source line.
+//
+// The measurer is a hidden div with identical font / width / wrap rules to
+// the editor's content area. Each source line is one <div>; we read
+// offsetHeight from each and build a cumulative offset table.
+
+let editorMeasurer = null;
+let editorLineMetricsCache = null; // { offsets, heights }
+
+function ensureEditorMeasurer() {
+  if (editorMeasurer) return editorMeasurer;
+  editorMeasurer = document.createElement('div');
+  editorMeasurer.id = 'editor-line-measurer';
+  editorMeasurer.style.cssText = [
+    'position: absolute',
+    'visibility: hidden',
+    'top: 0',
+    'left: -99999px',
+    'pointer-events: none',
+    'white-space: pre-wrap',
+    'word-wrap: break-word',
+    'overflow-wrap: break-word',
+  ].join('; ');
+  document.body.appendChild(editorMeasurer);
+  return editorMeasurer;
+}
+
+function invalidateEditorLineMetrics() {
+  editorLineMetricsCache = null;
+}
+
+// offsets[i] = y-pixel offset of source line i from the top of editor
+// content (excluding the textarea's padding-top). heights[i] is the wrapped
+// height of source line i. offsets has length lines+1; offsets[lines] is
+// the total content height.
+function getEditorLineMetrics() {
+  if (editorLineMetricsCache) return editorLineMetricsCache;
+  const m = ensureEditorMeasurer();
+  const cs = getComputedStyle(editor);
+  const padL = parseFloat(cs.paddingLeft) || 0;
+  const padR = parseFloat(cs.paddingRight) || 0;
+  const contentW = editor.clientWidth - padL - padR;
+  m.style.width = Math.max(0, contentW) + 'px';
+  m.style.fontFamily = cs.fontFamily;
+  m.style.fontSize = cs.fontSize;
+  m.style.fontWeight = cs.fontWeight;
+  m.style.lineHeight = cs.lineHeight;
+  m.style.letterSpacing = cs.letterSpacing;
+  m.style.tabSize = cs.tabSize;
+  m.style.MozTabSize = cs.tabSize;
+
+  const lines = editor.value.split('\n');
+  let html = '';
+  for (let i = 0; i < lines.length; i++) {
+    // Empty source line still needs measurable height — use &nbsp; so the
+    // line box keeps its line-height.
+    const safe = lines[i].length === 0
+      ? '&nbsp;'
+      : lines[i]
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;');
+    html += `<div class="lm-row">${safe}</div>`;
+  }
+  m.innerHTML = html;
+
+  const rows = m.children;
+  const heights = new Array(lines.length);
+  const offsets = new Array(lines.length + 1);
+  offsets[0] = 0;
+  for (let i = 0; i < rows.length; i++) {
+    heights[i] = rows[i].offsetHeight;
+    offsets[i + 1] = offsets[i] + heights[i];
+  }
+  editorLineMetricsCache = { offsets, heights };
+  return editorLineMetricsCache;
+}
+
+// =========================================================================
 // LINE NUMBERS GUTTER
 // =========================================================================
-// A simple absolutely-positioned <div> on the left of #editor-wrap whose
-// scrollTop tracks the textarea. Only present when settings.lineNumbers is on
-// (CSS hides it otherwise but we also skip rebuilds when off).
+// Each source line gets one <div> in the gutter whose height matches its
+// wrapped height in the editor. The number anchors to the top of that cell,
+// so wrapped lines display the number on the FIRST visual row — matches the
+// convention used by VS Code and Obsidian.
 
 let lineNumbersEl = null;
 function ensureLineNumbersEl() {
@@ -1543,48 +1634,154 @@ function ensureLineNumbersEl() {
 function updateLineNumbers() {
   if (!settings.lineNumbers) return;
   const el = ensureLineNumbersEl();
-  const lines = editor.value.split('\n').length;
-  // Build only when count changed — avoids reflow on every keystroke.
-  if (el.dataset.count === String(lines)) return;
-  el.dataset.count = String(lines);
+  const { heights } = getEditorLineMetrics();
+  // innerHTML in one shot is far faster than per-cell createElement for
+  // multi-thousand-line docs.
   let html = '';
-  for (let i = 1; i <= lines; i++) html += i + '\n';
-  el.textContent = html;
+  for (let i = 0; i < heights.length; i++) {
+    html += `<div class="editor-ln" style="height:${heights[i]}px">${i + 1}</div>`;
+  }
+  el.innerHTML = html;
   el.scrollTop = editor.scrollTop;
 }
 
+// Width changes (window resize, view-mode toggle, splitter) invalidate the
+// wrap points, so the metrics cache must be cleared. ResizeObserver fires
+// after layout — no need to debounce.
+if (typeof ResizeObserver !== 'undefined') {
+  const ro = new ResizeObserver(() => {
+    invalidateEditorLineMetrics();
+    if (settings.lineNumbers) updateLineNumbers();
+  });
+  ro.observe(editor);
+}
+
 // =========================================================================
-// SCROLL SYNC
+// SCROLL SYNC — block-anchored, bidirectional
 // =========================================================================
-// Bidirectional proportional sync. Two edges:
-//   - editor scroll → preview scroll
-//   - preview scroll → editor scroll
-// Guard with a flag so the programmatic write doesn't re-trigger the other.
+// Naive ratio sync (scrollTop/maxScrollTop) drifts because raw markdown and
+// rendered HTML have different content densities. Instead we map source-line
+// position to the corresponding preview block (via blockMap, which knows
+// each block's startLine..endLine and renders into .md-block elements with a
+// data-md-block-id attribute). Within a block, we keep the proportional
+// position so partial scroll through a multi-line code block / paragraph
+// still tracks.
+//
+// Wrapping is handled by getEditorLineMetrics() — both directions translate
+// between pixel offset and source line using the per-line height table, so
+// scrolling stays accurate even when soft-wraps multiply the effective
+// height of a single source line.
 
 let isSyncingScroll = false;
+
+// Find the source line at the top of the editor viewport (0-based). Uses
+// the line-metrics table so soft-wraps are accounted for.
+function editorScrollTopToSourceLine() {
+  const cs = getComputedStyle(editor);
+  const padT = parseFloat(cs.paddingTop) || 0;
+  const y = Math.max(0, editor.scrollTop - padT);
+  const { offsets } = getEditorLineMetrics();
+  // Binary search for the largest i where offsets[i] <= y.
+  let lo = 0, hi = offsets.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (offsets[mid] <= y) lo = mid; else hi = mid - 1;
+  }
+  // Fractional progress within line `lo`.
+  const lineH = (offsets[lo + 1] ?? offsets[lo]) - offsets[lo];
+  const within = lineH > 0 ? (y - offsets[lo]) / lineH : 0;
+  return { line: lo, within };
+}
+
+// Convert a source-line position back to a target scrollTop in the editor.
+function sourceLineToEditorScrollTop(line, within = 0) {
+  const cs = getComputedStyle(editor);
+  const padT = parseFloat(cs.paddingTop) || 0;
+  const { offsets } = getEditorLineMetrics();
+  const idx = Math.max(0, Math.min(line, offsets.length - 2));
+  const lineH = offsets[idx + 1] - offsets[idx];
+  return padT + offsets[idx] + within * lineH;
+}
+
+// Find the block whose source-line range covers `line`. Falls back to the
+// nearest neighbour when the line sits between blocks (e.g. blank lines).
+function blockForLine(line) {
+  if (blockMap.length === 0) return null;
+  for (let i = 0; i < blockMap.length; i++) {
+    const b = blockMap[i];
+    if (line < b.endLine) {
+      // Either inside b, or in a gap before b (blank line). Use b either way.
+      return b;
+    }
+  }
+  return blockMap[blockMap.length - 1];
+}
+
+// Element + scroll-relative pixel position of a preview block.
+function previewBlockGeom(blockId) {
+  const el = preview.querySelector(`.md-block[data-md-block-id="${blockId}"]`);
+  if (!el) return null;
+  const r = el.getBoundingClientRect();
+  const sr = previewScroll.getBoundingClientRect();
+  return {
+    el,
+    top: r.top - sr.top + previewScroll.scrollTop,
+    height: r.height,
+  };
+}
+
 function syncPreviewScrollFromEditor() {
   if (!settings.scrollSync || isSyncingScroll) return;
-  const maxE = editor.scrollHeight - editor.clientHeight;
-  if (maxE <= 0) return;
-  const ratio = editor.scrollTop / maxE;
-  const maxP = previewScroll.scrollHeight - previewScroll.clientHeight;
-  if (maxP <= 0) return;
+  if (blockMap.length === 0) return;
+  const { line, within: lineWithin } = editorScrollTopToSourceLine();
+  const block = blockForLine(line);
+  if (!block) return;
+  const lineCount = Math.max(1, block.endLine - block.startLine);
+  const inBlock = (line >= block.startLine && line < block.endLine);
+  // Progress through the block: 0 at start, 1 at end. For lines in a gap
+  // before the block, clamp to 0.
+  const blockProgress = inBlock
+    ? Math.min(1, ((line - block.startLine) + lineWithin) / lineCount)
+    : 0;
+  const geom = previewBlockGeom(block.id);
+  if (!geom) return;
+  const target = geom.top + blockProgress * geom.height;
   isSyncingScroll = true;
-  previewScroll.scrollTop = ratio * maxP;
-  // Release on next frame so the resulting scroll event sees the flag set.
+  previewScroll.scrollTop = Math.max(0, target);
   requestAnimationFrame(() => { isSyncingScroll = false; });
 }
+
 function syncEditorScrollFromPreview() {
   if (!settings.scrollSync || isSyncingScroll) return;
-  const maxP = previewScroll.scrollHeight - previewScroll.clientHeight;
-  if (maxP <= 0) return;
-  const ratio = previewScroll.scrollTop / maxP;
-  const maxE = editor.scrollHeight - editor.clientHeight;
-  if (maxE <= 0) return;
+  if (blockMap.length === 0) return;
+  const previewTop = previewScroll.scrollTop;
+  // Find the block whose vertical span covers previewTop.
+  const sr = previewScroll.getBoundingClientRect();
+  let chosen = null;
+  let progress = 0;
+  for (let i = 0; i < blockMap.length; i++) {
+    const el = preview.querySelector(`.md-block[data-md-block-id="${blockMap[i].id}"]`);
+    if (!el) continue;
+    const r = el.getBoundingClientRect();
+    const top = r.top - sr.top + previewTop;
+    const bottom = top + r.height;
+    if (bottom > previewTop) {
+      chosen = blockMap[i];
+      progress = r.height > 0
+        ? Math.max(0, Math.min(1, (previewTop - top) / r.height))
+        : 0;
+      break;
+    }
+  }
+  if (!chosen) chosen = blockMap[blockMap.length - 1];
+  const lineCount = Math.max(1, chosen.endLine - chosen.startLine);
+  const targetLine = chosen.startLine + Math.floor(progress * lineCount);
+  const within = (progress * lineCount) - Math.floor(progress * lineCount);
+  const newScroll = sourceLineToEditorScrollTop(targetLine, within);
   isSyncingScroll = true;
-  editor.scrollTop = ratio * maxE;
-  editorHighlight.scrollTop = ratio * maxE;
-  if (lineNumbersEl) lineNumbersEl.scrollTop = ratio * maxE;
+  editor.scrollTop = newScroll;
+  editorHighlight.scrollTop = newScroll;
+  if (lineNumbersEl) lineNumbersEl.scrollTop = newScroll;
   requestAnimationFrame(() => { isSyncingScroll = false; });
 }
 previewScroll.addEventListener('scroll', syncEditorScrollFromPreview);
