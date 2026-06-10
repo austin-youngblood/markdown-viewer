@@ -754,3 +754,219 @@ body.tab-detaching * {
 }
 #update-install:hover { background: #1a73a8; }
 #update-install.hidden { display: none; }
+
+/* ============================================================================
+   VIEW MODES — editor-only / both / preview-only
+   ============================================================================ */
+body.view-editor-only #preview-pane { display: none; }
+body.view-preview-only #editor-pane { display: none; }
+/* Both is the default — no rule needed. */
+
+/* ============================================================================
+   READING MODE — hide preview edit affordances but keep checkboxes interactive
+   ============================================================================ */
+body.reading-mode .md-plus { display: none; }
+body.reading-mode #preview .md-block { cursor: default; }
+/* Block dblclick popover entirely. dblclick handler is JS so we also gate it
+   there, but disabling user-select keeps the visual feedback honest too. */
+
+/* ============================================================================
+   LINE NUMBERS GUTTER
+   ============================================================================ */
+#editor-line-numbers {
+  display: none;
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 44px;
+  padding: 16px 8px 16px 0;
+  background: #1c1c1c;
+  color: #555;
+  font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace;
+  font-size: 14px;
+  line-height: 1.6;
+  text-align: right;
+  white-space: pre;
+  overflow: hidden;
+  border-right: 1px solid #333;
+  pointer-events: none;
+  user-select: none;
+  z-index: 3;
+}
+body.line-numbers #editor-line-numbers { display: block; }
+body.line-numbers #editor-highlight,
+body.line-numbers #editor {
+  padding-left: 56px;
+}
+
+/* ============================================================================
+   HOME TAB
+   ============================================================================ */
+#home {
+  display: none;
+  height: calc(100vh - 28px - 36px);
+  overflow-y: auto;
+  background: #1e1e1e;
+  color: #e0e0e0;
+}
+body.home-active #home { display: block; }
+body.home-active #app { display: none; }
+
+.home-inner {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 48px 32px 64px;
+}
+.home-title {
+  margin: 0 0 24px 0;
+  font-size: 28px;
+  font-weight: 300;
+  color: #fff;
+}
+.home-actions {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 36px;
+}
+.home-action {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: #2a2a2c;
+  border: 1px solid #333;
+  border-radius: 8px;
+  color: #e0e0e0;
+  font-size: 15px;
+  padding: 16px 20px;
+  cursor: pointer;
+  transition: background 0.1s, border-color 0.1s;
+}
+.home-action:hover {
+  background: #333;
+  border-color: #007acc;
+  color: #fff;
+}
+.home-action-icon {
+  font-size: 18px;
+  line-height: 1;
+}
+
+.home-section { margin-bottom: 32px; }
+.home-section h2 {
+  margin: 0 0 12px 0;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #888;
+}
+.home-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid #2a2a2c;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.home-list-empty {
+  padding: 16px;
+  color: #777;
+  font-style: italic;
+  font-size: 13px;
+}
+.home-list-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border-bottom: 1px solid #2a2a2c;
+  background: #232325;
+}
+.home-list-item:last-child { border-bottom: none; }
+.home-list-item:hover { background: #2a2a2d; }
+
+.home-list-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  background: transparent;
+  border: none;
+  color: inherit;
+  text-align: left;
+  padding: 10px 14px;
+  cursor: pointer;
+  min-width: 0;
+}
+.home-list-name {
+  font-size: 14px;
+  color: #fff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+.home-list-path {
+  font-size: 11px;
+  color: #888;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+.home-list-star,
+.home-list-remove {
+  background: transparent;
+  border: none;
+  color: #777;
+  font-size: 16px;
+  width: 32px;
+  height: 32px;
+  cursor: pointer;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+.home-list-star.active { color: #ffcc55; }
+.home-list-star:hover,
+.home-list-remove:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+}
+.home-list-remove { margin-right: 6px; }
+
+/* ============================================================================
+   HOME TAB CHIP IN TAB BAR
+   ============================================================================ */
+.tab.tab-home {
+  min-width: 80px;
+  max-width: 100px;
+  background: #1c1c1c;
+}
+.tab.tab-home .tab-home-icon {
+  font-size: 14px;
+  color: #aaa;
+  line-height: 1;
+}
+.tab.tab-home.active .tab-home-icon { color: #007acc; }
+
+/* ============================================================================
+   FAVORITE STAR ON DOCUMENT TABS
+   ============================================================================ */
+.tab-fav-btn {
+  background: transparent;
+  border: none;
+  color: #666;
+  font-size: 13px;
+  padding: 0 4px;
+  cursor: pointer;
+  border-radius: 2px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+.tab-fav-btn.active { color: #ffcc55; }
+.tab-fav-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+}
+.tab-fav-btn.active:hover { color: #ffcc55; }

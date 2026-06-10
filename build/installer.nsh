@@ -30,6 +30,20 @@
   ; reference from `Page custom` to the functions (same pattern as the
   ; finish-page SHOWREADME callback further down).
   Function ShortcutPagePre
+    ; perMachine: false + allowToChangeInstallationDirectory: true causes
+    ; the installer to elevate and re-launch as an inner instance when the
+    ; user picks "all users". Any custom pages declared here would render
+    ; twice. Detect the inner instance, restore the choice the user made in
+    ; the outer pass, and skip the page (Abort in a Pre function skips it).
+    ${If} ${UAC_IsInnerInstance}
+      ClearErrors
+      ReadRegStr $ShortcutChoice HKCU "Software\${MD_APP_REG_NAME}" "InstallerShortcutChoice"
+      ${If} ${Errors}
+        StrCpy $ShortcutChoice ${BST_CHECKED}
+      ${EndIf}
+      Abort
+    ${EndIf}
+
     nsDialogs::Create 1018
     Pop $0
     StrCmp $0 "error" 0 +2
@@ -47,6 +61,10 @@
 
   Function ShortcutPageLeave
     ${NSD_GetState} $ShortcutCheckbox $ShortcutChoice
+    ; Bridge the choice across the UAC elevation: the inner instance reads
+    ; this back in ShortcutPagePre and skips the page. HKCU is the same user
+    ; in both passes for normal UAC-consent elevations.
+    WriteRegStr HKCU "Software\${MD_APP_REG_NAME}" "InstallerShortcutChoice" "$ShortcutChoice"
   FunctionEnd
 
   Page custom ShortcutPagePre ShortcutPageLeave
@@ -99,6 +117,10 @@
   ${If} $ShortcutChoice == ${BST_CHECKED}
     CreateShortCut "$DESKTOP\${PRODUCT_NAME}.lnk" "$INSTDIR\${APP_FILENAME}.exe" "" "$INSTDIR\${APP_FILENAME}.exe" 0
   ${EndIf}
+  ; Clean up the cross-instance choice bridge from HKCU. /ifempty drops the
+  ; parent key when nothing else lives under it.
+  DeleteRegValue HKCU "Software\${MD_APP_REG_NAME}" "InstallerShortcutChoice"
+  DeleteRegKey /ifempty HKCU "Software\${MD_APP_REG_NAME}"
 !macroend
 
 ; ============================================================================

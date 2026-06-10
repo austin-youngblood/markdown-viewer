@@ -10,6 +10,23 @@
 </head>
 <body>
   <div id="tab-bar"></div>
+  <div id="home">
+    <div class="home-inner">
+      <h1 class="home-title">Markdown Viewer</h1>
+      <div class="home-actions">
+        <button class="home-action" id="home-new"><span class="home-action-icon">＋</span><span>New Document</span></button>
+        <button class="home-action" id="home-open"><span class="home-action-icon">📂</span><span>Open...</span></button>
+      </div>
+      <section class="home-section" id="home-favorites-section">
+        <h2>Favorites</h2>
+        <ul class="home-list" id="home-favorites"></ul>
+      </section>
+      <section class="home-section" id="home-recents-section">
+        <h2>Recent</h2>
+        <ul class="home-list" id="home-recents"></ul>
+      </section>
+    </div>
+  </div>
   <div id="app">
     <div id="editor-pane">
       <div id="find-panel">
@@ -32,6 +49,12 @@
       </div>
       <div id="editor-body">
         <div id="insert-toolbar">
+          <button class="toolbar-btn fmt-btn" data-format="bold" title="Bold (Ctrl+B)"><b>B</b></button>
+          <button class="toolbar-btn fmt-btn" data-format="italic" title="Italic (Ctrl+I)"><i>I</i></button>
+          <button class="toolbar-btn fmt-btn" data-format="underline" title="Underline (Ctrl+U)"><u>U</u></button>
+          <button class="toolbar-btn fmt-btn" data-format="strike" title="Strikethrough"><s>S</s></button>
+          <button class="toolbar-btn fmt-btn" data-format="code" title="Inline code">&lt;&gt;</button>
+          <span class="toolbar-sep"></span>
           <button class="toolbar-btn" data-template="Heading 1" title="Heading 1">H1</button>
           <button class="toolbar-btn" data-template="Heading 2" title="Heading 2">H2</button>
           <button class="toolbar-btn" data-template="Heading 3" title="Heading 3">H3</button>

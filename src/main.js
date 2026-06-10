@@ -21,6 +21,148 @@ let lastFocusedWindow = null;
 let pendingFilePath = null;
 const TAB_BAR_HEIGHT_PX = 36; // must match #tab-bar height in styles.css
 
+// Autosave / crash-recovery backups land here. Each dirty tab gets a JSON
+// file keyed by a UUID the renderer generates; the file is deleted when the
+// tab is saved or the user discards it. On launch we scan this dir and any
+// survivors are re-opened as recovered tabs.
+// Lazy because `app.getPath('userData')` is only guaranteed once `app` is
+// ready, and this module runs at process start.
+function backupsDir() {
+  return path.join(app.getPath('userData'), 'backups');
+}
+async function ensureBackupsDir() {
+  await fs.mkdir(backupsDir(), { recursive: true });
+}
+function safeBackupName(id) {
+  return String(id).replace(/[^a-zA-Z0-9_-]/g, '') + '.json';
+}
+
+// =========================================================================
+// SETTINGS — persisted per-user UI prefs + recent files + favorites
+// =========================================================================
+// Lazily loaded on first access, written debounced. Everything has a default
+// so a fresh install never blocks on file IO.
+
+const SETTINGS_DEFAULTS = {
+  viewMode: 'both',         // 'editor' | 'both' | 'preview'
+  readingMode: false,
+  scrollSync: false,
+  lineNumbers: false,
+  recents: [],              // [{ path, openedAt }]
+  favorites: [],            // [{ path, addedAt }]
+};
+const RECENTS_MAX = 10;
+
+function settingsFile() {
+  return path.join(app.getPath('userData'), 'settings.json');
+}
+
+let cachedSettings = null;
+let settingsWriteTimer = null;
+
+async function loadSettings() {
+  if (cachedSettings) return cachedSettings;
+  try {
+    const raw = await fs.readFile(settingsFile(), 'utf8');
+    const parsed = JSON.parse(raw);
+    cachedSettings = { ...SETTINGS_DEFAULTS, ...parsed };
+    // Defensive: ensure arrays are arrays even if file was corrupted.
+    if (!Array.isArray(cachedSettings.recents)) cachedSettings.recents = [];
+    if (!Array.isArray(cachedSettings.favorites)) cachedSettings.favorites = [];
+  } catch (_e) {
+    cachedSettings = { ...SETTINGS_DEFAULTS };
+  }
+  return cachedSettings;
+}
+
+function scheduleSettingsWrite() {
+  if (settingsWriteTimer) clearTimeout(settingsWriteTimer);
+  settingsWriteTimer = setTimeout(async () => {
+    settingsWriteTimer = null;
+    try {
+      await fs.mkdir(path.dirname(settingsFile()), { recursive: true });
+      await fs.writeFile(settingsFile(), JSON.stringify(cachedSettings, null, 2), 'utf8');
+    } catch (e) {
+      console.error('settings write failed:', e && e.message);
+    }
+  }, 200);
+}
+
+function normalizePathForCompare(p) {
+  if (!p) return '';
+  return process.platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p);
+}
+
+async function addRecent(filePath) {
+  if (!filePath) return;
+  const s = await loadSettings();
+  const key = normalizePathForCompare(filePath);
+  s.recents = s.recents.filter(r => normalizePathForCompare(r.path) !== key);
+  s.recents.unshift({ path: filePath, openedAt: Date.now() });
+  if (s.recents.length > RECENTS_MAX) s.recents.length = RECENTS_MAX;
+  scheduleSettingsWrite();
+  rebuildMenu();
+  refreshJumpList();
+  broadcastToAllWindows('settings-changed', { recents: s.recents, favorites: s.favorites });
+}
+
+async function removeRecent(filePath) {
+  const s = await loadSettings();
+  const key = normalizePathForCompare(filePath);
+  const before = s.recents.length;
+  s.recents = s.recents.filter(r => normalizePathForCompare(r.path) !== key);
+  if (s.recents.length !== before) {
+    scheduleSettingsWrite();
+    rebuildMenu();
+    refreshJumpList();
+    broadcastToAllWindows('settings-changed', { recents: s.recents, favorites: s.favorites });
+  }
+}
+
+async function clearRecents() {
+  const s = await loadSettings();
+  if (s.recents.length === 0) return;
+  s.recents = [];
+  scheduleSettingsWrite();
+  rebuildMenu();
+  refreshJumpList();
+  broadcastToAllWindows('settings-changed', { recents: s.recents, favorites: s.favorites });
+}
+
+async function addFavorite(filePath) {
+  if (!filePath) return;
+  const s = await loadSettings();
+  const key = normalizePathForCompare(filePath);
+  if (s.favorites.some(f => normalizePathForCompare(f.path) === key)) return;
+  s.favorites.unshift({ path: filePath, addedAt: Date.now() });
+  scheduleSettingsWrite();
+  rebuildMenu();
+  refreshJumpList();
+  broadcastToAllWindows('settings-changed', { recents: s.recents, favorites: s.favorites });
+}
+
+async function removeFavorite(filePath) {
+  const s = await loadSettings();
+  const key = normalizePathForCompare(filePath);
+  const before = s.favorites.length;
+  s.favorites = s.favorites.filter(f => normalizePathForCompare(f.path) !== key);
+  if (s.favorites.length !== before) {
+    scheduleSettingsWrite();
+    rebuildMenu();
+    refreshJumpList();
+    broadcastToAllWindows('settings-changed', { recents: s.recents, favorites: s.favorites });
+  }
+}
+
+async function setViewSetting(key, value) {
+  const s = await loadSettings();
+  if (s[key] === value) return;
+  s[key] = value;
+  scheduleSettingsWrite();
+  rebuildMenu();
+  broadcastToAllWindows('view-setting-changed', { key, value });
+}
+
 // Tab registry: which window has which files open. Renderers push their
 // current file-path list via 'tab-list-changed' whenever it changes.
 // Keyed by BrowserWindow; values are Sets of normalized (lowercased on Win) paths.
@@ -85,13 +227,24 @@ async function sendFileToWindow(win, filePath) {
     if (existingWin.isMinimized()) existingWin.restore();
     existingWin.focus();
     existingWin.webContents.send('focus-tab', filePath);
+    await addRecent(filePath);
     return;
   }
   try {
     const content = await fs.readFile(filePath, 'utf8');
     win.webContents.send('file-loaded', { filePath, content });
+    await addRecent(filePath);
   } catch (e) {
-    dialog.showErrorBox('Failed to open file', `${filePath}\n\n${e.message}`);
+    // ENOENT here means a stale entry was clicked from Recent / Favorites /
+    // JumpList. Remove it from both lists silently and let the renderer show
+    // the error in the status bar rather than a modal.
+    if (e && e.code === 'ENOENT') {
+      await removeRecent(filePath);
+      await removeFavorite(filePath);
+      win.webContents.send('file-open-failed', { filePath, reason: 'missing' });
+    } else {
+      dialog.showErrorBox('Failed to open file', `${filePath}\n\n${e.message}`);
+    }
   }
 }
 
@@ -114,6 +267,16 @@ function createWindow(opts = {}) {
   });
   windows.add(win);
   win.on('focus', () => { lastFocusedWindow = win; });
+
+  // Intercept close to give the renderer a chance to prompt save / discard
+  // / cancel for each dirty tab. Once the renderer signals OK we set
+  // _allowClose and re-trigger close().
+  win.on('close', (e) => {
+    if (win._allowClose) return;
+    e.preventDefault();
+    win.webContents.send('attempt-window-close');
+  });
+
   win.on('closed', () => {
     windows.delete(win);
     tabRegistry.delete(win);
@@ -124,6 +287,9 @@ function createWindow(opts = {}) {
   win.webContents.once('did-finish-load', () => {
     if (opts.initialTabs && opts.initialTabs.length > 0) {
       win.webContents.send('init-tabs', opts.initialTabs);
+      // If a file was also passed in (e.g. user double-clicked a .md while
+      // recovered tabs are being restored), open it as an additional tab.
+      if (opts.filePath) sendFileToWindow(win, opts.filePath);
     } else if (opts.filePath) {
       sendFileToWindow(win, opts.filePath);
     }
@@ -136,7 +302,37 @@ function createWindow(opts = {}) {
 // MENU
 // =========================================================================
 
-function buildMenu() {
+function buildRecentSubmenu(recents) {
+  if (!recents || recents.length === 0) {
+    return [{ label: 'No recent documents', enabled: false }];
+  }
+  const items = recents.map(r => ({
+    label: r.path,
+    click: () => {
+      const win = focusedWindow() || createWindow();
+      sendFileToWindow(win, r.path);
+    },
+  }));
+  items.push({ type: 'separator' });
+  items.push({ label: 'Clear Recent', click: () => { clearRecents(); } });
+  return items;
+}
+
+function buildFavoritesSubmenu(favorites) {
+  if (!favorites || favorites.length === 0) {
+    return [{ label: 'No favorites', enabled: false }];
+  }
+  return favorites.map(f => ({
+    label: f.path,
+    click: () => {
+      const win = focusedWindow() || createWindow();
+      sendFileToWindow(win, f.path);
+    },
+  }));
+}
+
+function buildMenu(settings) {
+  const s = settings || cachedSettings || SETTINGS_DEFAULTS;
   return Menu.buildFromTemplate([
     {
       label: 'File',
@@ -145,6 +341,8 @@ function buildMenu() {
         { label: 'New Window',  accelerator: 'CmdOrCtrl+Shift+N', click: () => createWindow() },
         { type: 'separator' },
         { label: 'Open...',     accelerator: 'CmdOrCtrl+O',       click: openFile },
+        { label: 'Open Recent', submenu: buildRecentSubmenu(s.recents) },
+        { label: 'Favorites',   submenu: buildFavoritesSubmenu(s.favorites) },
         { type: 'separator' },
         { label: 'Save',        accelerator: 'CmdOrCtrl+S',       click: () => focusedWindow()?.webContents.send('menu-save') },
         { label: 'Save As...',  accelerator: 'CmdOrCtrl+Shift+S', click: () => focusedWindow()?.webContents.send('menu-save-as') },
@@ -171,7 +369,26 @@ function buildMenu() {
     {
       label: 'View',
       submenu: [
-        { label: 'Toggle Editor', accelerator: 'CmdOrCtrl+E', click: () => focusedWindow()?.webContents.send('toggle-editor') },
+        { label: 'Editor Only',   accelerator: 'CmdOrCtrl+1', type: 'radio',
+          checked: s.viewMode === 'editor',
+          click: () => setViewSetting('viewMode', 'editor') },
+        { label: 'Editor + Preview', accelerator: 'CmdOrCtrl+2', type: 'radio',
+          checked: s.viewMode === 'both',
+          click: () => setViewSetting('viewMode', 'both') },
+        { label: 'Preview Only',  accelerator: 'CmdOrCtrl+3', type: 'radio',
+          checked: s.viewMode === 'preview',
+          click: () => setViewSetting('viewMode', 'preview') },
+        { type: 'separator' },
+        { label: 'Reading Mode (hide + buttons & click-to-edit)', accelerator: 'CmdOrCtrl+Shift+R', type: 'checkbox',
+          checked: !!s.readingMode,
+          click: (mi) => setViewSetting('readingMode', mi.checked) },
+        { label: 'Sync Scroll Between Panes', type: 'checkbox',
+          checked: !!s.scrollSync,
+          click: (mi) => setViewSetting('scrollSync', mi.checked) },
+        { label: 'Show Line Numbers', type: 'checkbox',
+          checked: !!s.lineNumbers,
+          click: (mi) => setViewSetting('lineNumbers', mi.checked) },
+        { type: 'separator' },
         { label: 'Next Tab',     accelerator: 'CmdOrCtrl+Tab',       click: () => focusedWindow()?.webContents.send('menu-next-tab') },
         { label: 'Previous Tab', accelerator: 'CmdOrCtrl+Shift+Tab', click: () => focusedWindow()?.webContents.send('menu-prev-tab') },
         { label: 'Check for Updates...', click: () => { safeCheckForUpdates(); focusedWindow()?.webContents.send('update-check-requested'); } },
@@ -202,6 +419,10 @@ function buildMenu() {
   ]);
 }
 
+function rebuildMenu() {
+  Menu.setApplicationMenu(buildMenu(cachedSettings));
+}
+
 async function openFile() {
   const win = focusedWindow();
   const result = await dialog.showOpenDialog(win, {
@@ -221,6 +442,7 @@ async function openFile() {
 
 ipcMain.handle('save-file', async (_event, { filePath, content }) => {
   await fs.writeFile(filePath, content, 'utf8');
+  await addRecent(filePath);
 });
 
 ipcMain.on('tab-list-changed', (event, paths) => {
@@ -255,6 +477,33 @@ ipcMain.handle('confirm-discard', async (event, { title } = {}) => {
   return result.response === 0;
 });
 
+// Three-way prompt used during window close for each dirty tab.
+// Returns 'save' | 'discard' | 'cancel'.
+ipcMain.handle('confirm-save-discard-cancel', async (event, { title } = {}) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const result = await dialog.showMessageBox(win, {
+    type: 'warning',
+    buttons: ['Save', "Don't Save", 'Cancel'],
+    defaultId: 0,
+    cancelId: 2,
+    title: 'Unsaved Changes',
+    message: `Save changes to "${title || 'this tab'}" before closing?`,
+    detail: 'If you don\'t save, your changes will be lost.',
+    noLink: true,
+  });
+  return ['save', 'discard', 'cancel'][result.response];
+});
+
+// Renderer's verdict after walking every dirty tab. `true` means proceed.
+ipcMain.on('window-close-decision', (event, ok) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win) return;
+  if (ok) {
+    win._allowClose = true;
+    win.close();
+  }
+});
+
 ipcMain.handle('close-window', (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (win) win.close();
@@ -284,6 +533,84 @@ ipcMain.handle('detach-tab', (event, { tab, screenX, screenY }) => {
   return true;
 });
 
+ipcMain.handle('backup-write', async (_e, { id, filePath, content, title }) => {
+  if (!id) return;
+  await ensureBackupsDir();
+  const file = path.join(backupsDir(), safeBackupName(id));
+  const payload = JSON.stringify({ id, filePath, content, title, savedAt: Date.now() });
+  await fs.writeFile(file, payload, 'utf8');
+});
+
+ipcMain.handle('backup-delete', async (_e, { id }) => {
+  if (!id) return;
+  try {
+    await fs.unlink(path.join(backupsDir(), safeBackupName(id)));
+  } catch (_e) {}
+});
+
+async function loadOrphanBackups() {
+  try {
+    await ensureBackupsDir();
+    const dir = backupsDir();
+    const files = await fs.readdir(dir);
+    const out = [];
+    for (const f of files) {
+      if (!f.endsWith('.json')) continue;
+      try {
+        const raw = await fs.readFile(path.join(dir, f), 'utf8');
+        const data = JSON.parse(raw);
+        if (data && typeof data.content === 'string') out.push(data);
+      } catch (_e) {}
+    }
+    out.sort((a, b) => (a.savedAt || 0) - (b.savedAt || 0));
+    return out;
+  } catch (_e) {
+    return [];
+  }
+}
+
+async function purgeOrphanBackups() {
+  try {
+    const dir = backupsDir();
+    const files = await fs.readdir(dir);
+    await Promise.all(files
+      .filter(f => f.endsWith('.json'))
+      .map(f => fs.unlink(path.join(dir, f)).catch(() => {})));
+  } catch (_e) {}
+}
+
+ipcMain.handle('settings-get', async () => {
+  return await loadSettings();
+});
+
+ipcMain.handle('settings-set-view', async (_e, { key, value }) => {
+  await setViewSetting(key, value);
+});
+
+ipcMain.handle('recents-add', async (_e, filePath) => addRecent(filePath));
+ipcMain.handle('recents-remove', async (_e, filePath) => removeRecent(filePath));
+ipcMain.handle('favorites-add', async (_e, filePath) => addFavorite(filePath));
+ipcMain.handle('favorites-remove', async (_e, filePath) => removeFavorite(filePath));
+
+ipcMain.handle('open-path', async (event, filePath) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  await sendFileToWindow(win, filePath);
+});
+
+ipcMain.handle('show-open-dialog', async (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const result = await dialog.showOpenDialog(win, {
+    properties: ['openFile'],
+    filters: [
+      { name: 'Markdown', extensions: ['md', 'markdown', 'mdx', 'mdown'] },
+      { name: 'All Files', extensions: ['*'] },
+    ],
+  });
+  if (result.canceled || result.filePaths.length === 0) return null;
+  await sendFileToWindow(win, result.filePaths[0]);
+  return result.filePaths[0];
+});
+
 ipcMain.handle('pick-image', async (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   const result = await dialog.showOpenDialog(win, {
@@ -296,6 +623,51 @@ ipcMain.handle('pick-image', async (event) => {
   if (result.canceled || result.filePaths.length === 0) return null;
   return result.filePaths[0];
 });
+
+// =========================================================================
+// WINDOWS JUMPLIST
+// =========================================================================
+// Lists Favorites (custom category) + the OS-managed "Recent" category on
+// taskbar right-click. Each task launches the app with the file path as argv,
+// caught by the single-instance second-instance handler.
+
+function refreshJumpList() {
+  if (process.platform !== 'win32') return;
+  const s = cachedSettings || SETTINGS_DEFAULTS;
+  const exe = process.execPath;
+  try {
+    const favTasks = (s.favorites || []).slice(0, 10).map(f => ({
+      type: 'task',
+      title: path.basename(f.path),
+      description: f.path,
+      program: exe,
+      args: `"${f.path}"`,
+      iconPath: exe,
+      iconIndex: 0,
+    }));
+    const recentTasks = (s.recents || []).slice(0, 10).map(r => ({
+      type: 'task',
+      title: path.basename(r.path),
+      description: r.path,
+      program: exe,
+      args: `"${r.path}"`,
+      iconPath: exe,
+      iconIndex: 0,
+    }));
+    const categories = [];
+    if (favTasks.length) categories.push({ name: 'Favorites', items: favTasks });
+    if (recentTasks.length) categories.push({ name: 'Recent', items: recentTasks });
+    if (categories.length === 0) {
+      app.setJumpList(null);
+    } else {
+      app.setJumpList(categories);
+    }
+  } catch (e) {
+    // setJumpList can throw if the JumpList is being modified by the user
+    // (e.g. they removed items themselves). Non-fatal.
+    console.error('setJumpList failed:', e && e.message);
+  }
+}
 
 // =========================================================================
 // APP LIFECYCLE
@@ -330,10 +702,47 @@ if (!gotLock) {
     }
   });
 
-  app.whenReady().then(() => {
-    Menu.setApplicationMenu(buildMenu());
+  app.whenReady().then(async () => {
+    await loadSettings();
+    rebuildMenu();
+    refreshJumpList();
     pendingFilePath = getFileFromArgs(process.argv);
-    createWindow({ filePath: pendingFilePath });
+    const orphans = await loadOrphanBackups();
+    let initialTabs = null;
+    if (orphans.length > 0) {
+      // Build a preview list of the dropped documents for the dialog body.
+      const preview = orphans.slice(0, 8)
+        .map(o => '• ' + (o.title || (o.filePath ? path.basename(o.filePath) : 'Untitled')))
+        .join('\n');
+      const extra = orphans.length > 8 ? `\n…and ${orphans.length - 8} more` : '';
+      const { response } = await dialog.showMessageBox({
+        type: 'question',
+        buttons: ['Recover', 'Discard'],
+        defaultId: 0,
+        cancelId: 1,
+        title: 'Recover Unsaved Documents',
+        message: `${orphans.length} unsaved document${orphans.length === 1 ? '' : 's'} from your previous session.`,
+        detail: `${preview}${extra}\n\nRecover them as tabs, or discard the backups?`,
+        noLink: true,
+      });
+      if (response === 0) {
+        initialTabs = orphans.map(o => ({
+          backupId: o.id,
+          filePath: o.filePath || null,
+          content: o.content || '',
+          title: o.title || 'Recovered',
+          isModified: true,
+          recovered: true,
+        }));
+      } else {
+        await purgeOrphanBackups();
+      }
+    }
+    if (initialTabs) {
+      createWindow({ initialTabs, filePath: pendingFilePath });
+    } else {
+      createWindow({ filePath: pendingFilePath });
+    }
     pendingFilePath = null;
   });
 }

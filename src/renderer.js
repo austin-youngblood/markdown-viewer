@@ -53,6 +53,67 @@ const popoverHost = document.getElementById('popover-host');
 const insertMenuHost = document.getElementById('insert-menu-host');
 
 // =========================================================================
+// PERSISTED SETTINGS (mirrored from main)
+// =========================================================================
+// settings shape: { viewMode, readingMode, scrollSync, lineNumbers, recents[], favorites[] }
+// Loaded once at startup, kept in sync via 'settings-changed' and
+// 'view-setting-changed' broadcasts from main.
+
+const settings = {
+  viewMode: 'both',
+  readingMode: false,
+  scrollSync: false,
+  lineNumbers: false,
+  recents: [],
+  favorites: [],
+};
+
+function applyViewMode(mode) {
+  const cl = document.body.classList;
+  cl.remove('view-editor-only', 'view-both', 'view-preview-only');
+  if (mode === 'editor') cl.add('view-editor-only');
+  else if (mode === 'preview') cl.add('view-preview-only');
+  else cl.add('view-both');
+}
+
+function applyReadingMode(on) {
+  document.body.classList.toggle('reading-mode', !!on);
+}
+
+function applyLineNumbers(on) {
+  document.body.classList.toggle('line-numbers', !!on);
+  if (on) updateLineNumbers();
+}
+
+function applyAllViewSettings() {
+  applyViewMode(settings.viewMode);
+  applyReadingMode(settings.readingMode);
+  applyLineNumbers(settings.lineNumbers);
+}
+
+ipcRenderer.on('view-setting-changed', (_e, { key, value }) => {
+  settings[key] = value;
+  if (key === 'viewMode') applyViewMode(value);
+  else if (key === 'readingMode') applyReadingMode(value);
+  else if (key === 'lineNumbers') applyLineNumbers(value);
+  // scrollSync needs no DOM change — the scroll handlers check the flag live.
+});
+
+ipcRenderer.on('settings-changed', (_e, patch) => {
+  if (patch.recents) settings.recents = patch.recents;
+  if (patch.favorites) settings.favorites = patch.favorites;
+  refreshHomeIfVisible();
+  renderTabBar();
+});
+
+ipcRenderer.on('file-open-failed', (_e, { filePath, reason }) => {
+  if (reason === 'missing') {
+    statusEl.textContent = `File not found, removed from recent: ${filePath}`;
+    setTimeout(() => { statusEl.textContent = ''; }, 4000);
+  }
+});
+
+// =========================================================================
 // STATE
 // =========================================================================
 
@@ -71,6 +132,35 @@ const tabs = [];
 let activeTabId = null;
 let nextTabId = 1;
 let isSwitchingTab = false;       // suppresses input handler's "mark modified" during programmatic swap
+
+const HOME_TAB_ID = 'home';
+function isHomeTab(t) {
+  return !!t && t.id === HOME_TAB_ID;
+}
+function isHomeTabId(id) {
+  return id === HOME_TAB_ID;
+}
+function documentTabs() {
+  return tabs.filter(t => !isHomeTab(t));
+}
+function ensureHomeTab() {
+  if (tabs.length === 0 || tabs[0].id !== HOME_TAB_ID) {
+    const homeTab = {
+      id: HOME_TAB_ID,
+      filePath: null,
+      title: 'Home',
+      isModified: false,
+      content: '',
+      scrollTop: 0,
+      selStart: 0,
+      selEnd: 0,
+      previewScrollTop: 0,
+      backupId: null,
+      isHome: true,
+    };
+    tabs.unshift(homeTab);
+  }
+}
 
 function activeTab() {
   return tabs.find(t => t.id === activeTabId) || null;
@@ -96,7 +186,54 @@ function makeTab({ filePath = null, content = '', title = null } = {}) {
     selStart: 0,
     selEnd: 0,
     previewScrollTop: 0,
+    backupId: null, // assigned on first dirty edit; cleared when saved/discarded
   };
+}
+
+// =========================================================================
+// AUTOSAVE / BACKUP RECOVERY
+// =========================================================================
+// Each dirty tab is mirrored to a JSON file under the app's userData/backups/
+// dir. Writes are debounced 1.5s after the last edit. The backup is deleted on
+// clean save and on tab close (whether the user kept or discarded the work) so
+// only true survivors of a crash / hard quit trigger recovery on next launch.
+
+const BACKUP_DEBOUNCE_MS = 1500;
+const backupTimers = new Map(); // tabId -> setTimeout handle
+
+function genBackupId() {
+  if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+    return window.crypto.randomUUID();
+  }
+  return 'b-' + Math.random().toString(36).slice(2, 10) + '-' + Math.random().toString(36).slice(2, 10);
+}
+
+function scheduleBackup(tab) {
+  if (!tab) return;
+  if (!tab.backupId) tab.backupId = genBackupId();
+  const existing = backupTimers.get(tab.id);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(() => {
+    backupTimers.delete(tab.id);
+    const content = (tab.id === activeTabId) ? editor.value : tab.content;
+    ipcRenderer.invoke('backup-write', {
+      id: tab.backupId,
+      filePath: tab.filePath,
+      content,
+      title: tab.title,
+    }).catch(() => {});
+  }, BACKUP_DEBOUNCE_MS);
+  backupTimers.set(tab.id, timer);
+}
+
+function clearBackup(tab) {
+  if (!tab) return;
+  const timer = backupTimers.get(tab.id);
+  if (timer) { clearTimeout(timer); backupTimers.delete(tab.id); }
+  if (tab.backupId) {
+    ipcRenderer.invoke('backup-delete', { id: tab.backupId }).catch(() => {});
+    tab.backupId = null;
+  }
 }
 
 const findState = {
@@ -632,6 +769,9 @@ function closeActivePopover() {
 
 // Double-click on block opens edit popover (preserves text selection on single click)
 preview.addEventListener('dblclick', (e) => {
+  // Reading mode disables click-to-edit entirely (checkboxes still work via
+  // the 'change' handler).
+  if (settings.readingMode) return;
   if (e.target.closest('.md-plus')) return;
   if (e.target.closest('a')) return; // Don't trigger on links
   if (e.target.tagName === 'INPUT') return; // Don't trigger on task checkboxes
@@ -673,12 +813,35 @@ preview.addEventListener('change', (e) => {
   }
   if (hit < 0) return;
 
+  // applyEdit() calls editor.focus() + setSelectionRange(), which would yank
+  // the textarea scroll to the cursor position (and jumps to top if the
+  // cursor was at offset 0 in some other tab). Capture editor and preview
+  // scroll positions and the selection up front so we can restore both after
+  // render() finishes. Selection too — focus restoration alone isn't enough
+  // because the textarea will scroll to keep the caret visible.
+  const savedEditorScroll = editor.scrollTop;
+  const savedSelStart = editor.selectionStart;
+  const savedSelEnd = editor.selectionEnd;
+  const savedPreviewScroll = previewScroll.scrollTop;
+  const savedFocus = document.activeElement;
+
   const newMarker = cb.checked ? '[x]' : '[ ]';
   let newSource = block.source.slice(0, hit) + newMarker + block.source.slice(hit + 3);
   if (!newSource.endsWith('\n')) newSource += '\n';
   applyEdit(block.startChar, block.endChar, newSource);
   markDirty();
-  render();
+  // render() rebuilds the preview innerHTML which would reset preview scroll
+  // to 0; restore on the next frame after layout. Editor scroll is restored
+  // immediately because applyEdit's setSelectionRange already happened.
+  try { editor.setSelectionRange(savedSelStart, savedSelEnd); } catch (_e) {}
+  editor.scrollTop = savedEditorScroll;
+  editorHighlight.scrollTop = savedEditorScroll;
+  if (savedFocus && savedFocus !== editor) {
+    try { savedFocus.focus(); } catch (_e) {}
+  }
+  render().then(() => {
+    previewScroll.scrollTop = savedPreviewScroll;
+  });
 });
 
 // =========================================================================
@@ -921,11 +1084,170 @@ preview.addEventListener('click', (e) => {
 insertToolbar.addEventListener('click', (e) => {
   const btn = e.target.closest('.toolbar-btn');
   if (!btn) return;
+  if (btn.dataset.format) {
+    applyFormat(btn.dataset.format);
+    return;
+  }
   const templateLabel = btn.dataset.template;
   const template = elementTemplates.find(t => t.label === templateLabel);
   if (!template) return;
   handleInsert(template, editor.selectionStart);
 });
+
+// =========================================================================
+// INLINE FORMAT (bold/italic/underline/strike/code)
+// =========================================================================
+// Toggle model:
+//   1. Peel recognized wrappers outward from the selection one layer at a
+//      time. Runs of `*` are merged into a single "stars" layer with a count
+//      — that's how bold (`**`) and italic (`*`) compose into `***` for
+//      bold+italic without ever stripping each other.
+//   2. Decide whether the requested format is already present anywhere in
+//      the peeled chain (stars >= 2 → bold; stars odd → italic; matching
+//      kind for the others). If yes, remove that contribution; if no, add
+//      it at the innermost layer.
+//   3. Rebuild the source from outside in and replace the entire peeled
+//      span.
+// Empty selection still falls back to the simple placeholder-wrap path —
+// peeling there would do strange things to neighboring text.
+
+const FORMAT_MARKERS = {
+  bold:      { open: '**',  close: '**',   placeholder: 'bold text' },
+  italic:    { open: '*',   close: '*',    placeholder: 'italic text' },
+  underline: { open: '<u>', close: '</u>', placeholder: 'underlined text' },
+  strike:    { open: '~~',  close: '~~',   placeholder: 'strikethrough' },
+  code:      { open: '`',   close: '`',    placeholder: 'code' },
+};
+
+// Non-star markers, longest-open first so '~~' isn't shadowed by '`' etc.
+const NON_STAR_MARKERS = [
+  { kind: 'underline', open: '<u>', close: '</u>' },
+  { kind: 'strike',    open: '~~',  close: '~~'   },
+  { kind: 'code',      open: '`',   close: '`'    },
+];
+
+// Peel format layers outward from [start, end]. Returns the layer chain
+// (innermost first) plus the outermost left/right boundaries reached.
+function peelFormatLayers(v, start, end) {
+  let left = start;
+  let right = end;
+  const layers = [];
+  while (true) {
+    let progress = false;
+
+    // Try non-star markers (distinct openers — straightforward match).
+    for (const m of NON_STAR_MARKERS) {
+      if (left - m.open.length < 0) continue;
+      if (v.slice(left - m.open.length, left) === m.open &&
+          v.slice(right, right + m.close.length) === m.close) {
+        layers.push({ kind: m.kind, open: m.open, close: m.close });
+        left -= m.open.length;
+        right += m.close.length;
+        progress = true;
+        break;
+      }
+    }
+    if (progress) continue;
+
+    // Star peel: collapse the full adjacent runs on each side into one
+    // symmetric layer so `***` stays a single entity.
+    let sL = 0, sR = 0;
+    while (left - sL - 1 >= 0 && v[left - sL - 1] === '*') sL++;
+    while (right + sR < v.length && v[right + sR] === '*') sR++;
+    const s = Math.min(sL, sR);
+    if (s > 0) {
+      layers.push({ kind: 'stars', count: s });
+      left -= s;
+      right += s;
+      continue;
+    }
+    break;
+  }
+  return { layers, outerLeft: left, outerRight: right };
+}
+
+function applyFormat(kind) {
+  const start = editor.selectionStart;
+  const end = editor.selectionEnd;
+  const v = editor.value;
+
+  // Empty selection: keep the placeholder-wrap shortcut.
+  if (start === end) {
+    const m = FORMAT_MARKERS[kind];
+    if (!m) return;
+    applyEdit(start, end, m.open + m.placeholder + m.close);
+    editor.setSelectionRange(start + m.open.length, start + m.open.length + m.placeholder.length);
+    markDirty();
+    render();
+    return;
+  }
+
+  const { layers, outerLeft, outerRight } = peelFormatLayers(v, start, end);
+  const selected = v.slice(start, end);
+  const isStar = (kind === 'bold' || kind === 'italic');
+  let removed = false;
+
+  // Search outermost layer first so pressing the format key removes the
+  // *outer* contribution — matches the user's mental model of "untangle the
+  // wrapping I just added."
+  for (let i = layers.length - 1; i >= 0; i--) {
+    const L = layers[i];
+    if (isStar) {
+      if (L.kind !== 'stars') continue;
+      if (kind === 'bold' && L.count >= 2) {
+        L.count -= 2;
+        if (L.count === 0) layers.splice(i, 1);
+        removed = true;
+        break;
+      }
+      if (kind === 'italic' && (L.count % 2 === 1)) {
+        L.count -= 1;
+        if (L.count === 0) layers.splice(i, 1);
+        removed = true;
+        break;
+      }
+    } else if (L.kind === kind) {
+      layers.splice(i, 1);
+      removed = true;
+      break;
+    }
+  }
+
+  if (!removed) {
+    if (isStar) {
+      const add = kind === 'bold' ? 2 : 1;
+      // Merge into an existing innermost stars run if there is one.
+      if (layers.length > 0 && layers[0].kind === 'stars') {
+        layers[0].count += add;
+      } else {
+        layers.unshift({ kind: 'stars', count: add });
+      }
+    } else {
+      const m = FORMAT_MARKERS[kind];
+      layers.unshift({ kind, open: m.open, close: m.close });
+    }
+  }
+
+  // Rebuild outer-first so markers nest in the same order as the peel chain.
+  let leftStr = '', rightStr = '';
+  for (let i = layers.length - 1; i >= 0; i--) {
+    const L = layers[i];
+    if (L.kind === 'stars') {
+      const stars = '*'.repeat(L.count);
+      leftStr += stars;
+      rightStr = stars + rightStr;
+    } else {
+      leftStr += L.open;
+      rightStr = L.close + rightStr;
+    }
+  }
+
+  const newText = leftStr + selected + rightStr;
+  applyEdit(outerLeft, outerRight, newText);
+  editor.setSelectionRange(outerLeft + leftStr.length, outerLeft + leftStr.length + selected.length);
+  markDirty();
+  render();
+}
 
 // =========================================================================
 // EDITOR EVENTS
@@ -936,13 +1258,336 @@ editor.addEventListener('input', () => {
   clearTimeout(renderTimer);
   renderTimer = setTimeout(render, 150);
   markDirty();
+  updateLineNumbers();
   if (findState.open && findState.query) updateMatches();
 });
 
 // Keep the highlight overlay in lock-step with textarea scroll.
 editor.addEventListener('scroll', () => {
   editorHighlight.scrollTop = editor.scrollTop;
+  if (lineNumbersEl) lineNumbersEl.scrollTop = editor.scrollTop;
+  syncPreviewScrollFromEditor();
 });
+
+// =========================================================================
+// EDITOR KEYBOARD: Tab indent + list continuation
+// =========================================================================
+
+const INDENT = '  '; // 2 spaces, per user preference
+
+// Parse a single line for a list-marker prefix. Returns:
+//   { prefix, content, kind, num }   where prefix is indent + marker + space,
+//                                    content is everything after,
+//                                    kind is 'bullet' | 'numbered' | 'task',
+//                                    num is the captured number (numbered only).
+// Returns null if the line isn't a recognized list line.
+function parseListLine(line) {
+  // Task list FIRST so it isn't shadowed by the bullet matcher.
+  let m = /^([ \t]*)([-*+])[ \t]+\[([ xX])\][ \t]?(.*)$/.exec(line);
+  if (m) {
+    const prefix = `${m[1]}${m[2]} [ ] `;
+    return { prefix, content: m[4], kind: 'task' };
+  }
+  m = /^([ \t]*)(\d+)\.[ \t]+(.*)$/.exec(line);
+  if (m) {
+    const prefix = `${m[1]}${m[2]}. `;
+    return { prefix, content: m[3], kind: 'numbered', num: parseInt(m[2], 10) };
+  }
+  m = /^([ \t]*)([-*+])[ \t]+(.*)$/.exec(line);
+  if (m) {
+    const prefix = `${m[1]}${m[2]} `;
+    return { prefix, content: m[3], kind: 'bullet' };
+  }
+  return null;
+}
+
+// Find the [start, end) char range of the line containing `pos`.
+function lineRangeAt(text, pos) {
+  let start = pos;
+  while (start > 0 && text[start - 1] !== '\n') start--;
+  let end = pos;
+  while (end < text.length && text[end] !== '\n') end++;
+  return [start, end];
+}
+
+editor.addEventListener('keydown', (e) => {
+  // Tab: indent at cursor or selection.
+  if (e.key === 'Tab' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    handleTabKey(e.shiftKey);
+    return;
+  }
+  // Enter / Shift+Enter: list continuation / list exit / plain newline.
+  if (e.key === 'Enter' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    if (handleEnterKey(e.shiftKey)) {
+      e.preventDefault();
+    }
+    return;
+  }
+});
+
+function handleTabKey(shifted) {
+  const v = editor.value;
+  const start = editor.selectionStart;
+  const end = editor.selectionEnd;
+
+  // Multi-line selection → block indent/outdent every line covered.
+  // (Single-line selection still uses the block path so Shift+Tab can outdent.)
+  const sel = v.slice(start, end);
+  const isMultiLine = sel.includes('\n');
+  if (start !== end && (isMultiLine || shifted)) {
+    const [lineStart] = lineRangeAt(v, start);
+    // End boundary: if selection ends exactly at a line start, don't grab the
+    // next line. Otherwise extend to end of its line.
+    let blockEnd = end;
+    if (end > start && v[end - 1] !== '\n') {
+      while (blockEnd < v.length && v[blockEnd] !== '\n') blockEnd++;
+    }
+    const block = v.slice(lineStart, blockEnd);
+    let newBlock;
+    if (shifted) {
+      newBlock = block.replace(/^( {1,2}|\t)/gm, '');
+    } else {
+      newBlock = block.replace(/^/gm, INDENT);
+    }
+    applyEdit(lineStart, blockEnd, newBlock);
+    const delta = newBlock.length - block.length;
+    const newStart = Math.max(lineStart, start + (shifted ? -INDENT.length : INDENT.length));
+    editor.setSelectionRange(newStart, end + delta);
+    markDirty();
+    render();
+    return;
+  }
+
+  // Caret-only: outdent the current line on Shift+Tab.
+  if (shifted) {
+    const [lineStart] = lineRangeAt(v, start);
+    const line = v.slice(lineStart, lineStart + INDENT.length);
+    if (line === INDENT) {
+      applyEdit(lineStart, lineStart + INDENT.length, '');
+      const newPos = Math.max(lineStart, start - INDENT.length);
+      editor.setSelectionRange(newPos, newPos);
+      markDirty();
+      render();
+    } else if (v[lineStart] === '\t') {
+      applyEdit(lineStart, lineStart + 1, '');
+      const newPos = Math.max(lineStart, start - 1);
+      editor.setSelectionRange(newPos, newPos);
+      markDirty();
+      render();
+    }
+    return;
+  }
+
+  // Caret-only insert: 2 spaces at cursor.
+  applyEdit(start, end, INDENT);
+  const newPos = start + INDENT.length;
+  editor.setSelectionRange(newPos, newPos);
+  markDirty();
+  render();
+}
+
+// Returns true if we handled the key (caller preventDefaults).
+function handleEnterKey(shifted) {
+  const v = editor.value;
+  const start = editor.selectionStart;
+  const end = editor.selectionEnd;
+  if (start !== end) return false; // selection: let default Enter replace it
+
+  const [lineStart, lineEnd] = lineRangeAt(v, start);
+  const line = v.slice(lineStart, lineEnd);
+  const parsed = parseListLine(line);
+  if (!parsed) return false; // not a list line — default Enter
+
+  // Shift+Enter or Enter at column 0 (cursor before any marker text) → plain
+  // newline that breaks out of the list.
+  if (shifted || start === lineStart) {
+    applyEdit(start, end, '\n');
+    const newPos = start + 1;
+    editor.setSelectionRange(newPos, newPos);
+    markDirty();
+    render();
+    return true;
+  }
+
+  // Empty list item (marker but no text content) → strip the marker so the
+  // next Enter on a fresh marker exits the list cleanly.
+  if (parsed.content.length === 0) {
+    applyEdit(lineStart, lineEnd, '');
+    editor.setSelectionRange(lineStart, lineStart);
+    markDirty();
+    render();
+    return true;
+  }
+
+  // Continue the list with a fresh marker. Numbered lists repeat the same
+  // number per the user's pick (CommonMark will renumber on render).
+  applyEdit(start, end, '\n' + parsed.prefix);
+  const newPos = start + 1 + parsed.prefix.length;
+  editor.setSelectionRange(newPos, newPos);
+  markDirty();
+  render();
+  return true;
+}
+
+// =========================================================================
+// HOME TAB CONTENT
+// =========================================================================
+// Buttons + lists. The lists are mirrored from settings.{favorites,recents}
+// which main keeps in sync via 'settings-changed' broadcasts.
+
+const homeEl = document.getElementById('home');
+const homeFavoritesUl = document.getElementById('home-favorites');
+const homeRecentsUl = document.getElementById('home-recents');
+const homeFavoritesSection = document.getElementById('home-favorites-section');
+const homeRecentsSection = document.getElementById('home-recents-section');
+
+function basenameOf(p) {
+  return (p || '').split(/[\\/]/).pop() || p;
+}
+
+function renderHomeList(ul, items, opts) {
+  ul.innerHTML = '';
+  if (!items || items.length === 0) {
+    const li = document.createElement('li');
+    li.className = 'home-list-empty';
+    li.textContent = opts.emptyText;
+    ul.appendChild(li);
+    return;
+  }
+  items.forEach(item => {
+    const li = document.createElement('li');
+    li.className = 'home-list-item';
+
+    const main = document.createElement('button');
+    main.className = 'home-list-main';
+    main.title = item.path;
+    main.innerHTML = `
+      <span class="home-list-name"></span>
+      <span class="home-list-path"></span>
+    `;
+    main.querySelector('.home-list-name').textContent = basenameOf(item.path);
+    main.querySelector('.home-list-path').textContent = item.path;
+    main.addEventListener('click', () => {
+      ipcRenderer.invoke('open-path', item.path);
+    });
+    li.appendChild(main);
+
+    const isFav = isFavoritePath(item.path);
+    const star = document.createElement('button');
+    star.className = 'home-list-star';
+    star.classList.toggle('active', isFav);
+    star.textContent = isFav ? '★' : '☆';
+    star.title = isFav ? 'Remove from Favorites' : 'Pin to Favorites';
+    star.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (isFav) ipcRenderer.invoke('favorites-remove', item.path);
+      else ipcRenderer.invoke('favorites-add', item.path);
+    });
+    li.appendChild(star);
+
+    if (opts.allowRemove) {
+      const remove = document.createElement('button');
+      remove.className = 'home-list-remove';
+      remove.textContent = '×';
+      remove.title = 'Remove from Recent';
+      remove.addEventListener('click', (e) => {
+        e.stopPropagation();
+        ipcRenderer.invoke('recents-remove', item.path);
+      });
+      li.appendChild(remove);
+    }
+
+    ul.appendChild(li);
+  });
+}
+
+function renderHome() {
+  renderHomeList(homeFavoritesUl, settings.favorites, {
+    emptyText: 'No favorites yet. Pin from Recent or click the ☆ on a tab.',
+    allowRemove: false,
+  });
+  renderHomeList(homeRecentsUl, settings.recents, {
+    emptyText: 'No recent documents yet.',
+    allowRemove: true,
+  });
+}
+
+function refreshHomeIfVisible() {
+  if (document.body.classList.contains('home-active')) renderHome();
+}
+
+document.getElementById('home-new').addEventListener('click', () => {
+  createNewTab();
+});
+document.getElementById('home-open').addEventListener('click', () => {
+  ipcRenderer.invoke('show-open-dialog');
+});
+
+// =========================================================================
+// LINE NUMBERS GUTTER
+// =========================================================================
+// A simple absolutely-positioned <div> on the left of #editor-wrap whose
+// scrollTop tracks the textarea. Only present when settings.lineNumbers is on
+// (CSS hides it otherwise but we also skip rebuilds when off).
+
+let lineNumbersEl = null;
+function ensureLineNumbersEl() {
+  if (lineNumbersEl) return lineNumbersEl;
+  lineNumbersEl = document.createElement('div');
+  lineNumbersEl.id = 'editor-line-numbers';
+  const wrap = document.getElementById('editor-wrap');
+  if (wrap) wrap.prepend(lineNumbersEl);
+  return lineNumbersEl;
+}
+function updateLineNumbers() {
+  if (!settings.lineNumbers) return;
+  const el = ensureLineNumbersEl();
+  const lines = editor.value.split('\n').length;
+  // Build only when count changed — avoids reflow on every keystroke.
+  if (el.dataset.count === String(lines)) return;
+  el.dataset.count = String(lines);
+  let html = '';
+  for (let i = 1; i <= lines; i++) html += i + '\n';
+  el.textContent = html;
+  el.scrollTop = editor.scrollTop;
+}
+
+// =========================================================================
+// SCROLL SYNC
+// =========================================================================
+// Bidirectional proportional sync. Two edges:
+//   - editor scroll → preview scroll
+//   - preview scroll → editor scroll
+// Guard with a flag so the programmatic write doesn't re-trigger the other.
+
+let isSyncingScroll = false;
+function syncPreviewScrollFromEditor() {
+  if (!settings.scrollSync || isSyncingScroll) return;
+  const maxE = editor.scrollHeight - editor.clientHeight;
+  if (maxE <= 0) return;
+  const ratio = editor.scrollTop / maxE;
+  const maxP = previewScroll.scrollHeight - previewScroll.clientHeight;
+  if (maxP <= 0) return;
+  isSyncingScroll = true;
+  previewScroll.scrollTop = ratio * maxP;
+  // Release on next frame so the resulting scroll event sees the flag set.
+  requestAnimationFrame(() => { isSyncingScroll = false; });
+}
+function syncEditorScrollFromPreview() {
+  if (!settings.scrollSync || isSyncingScroll) return;
+  const maxP = previewScroll.scrollHeight - previewScroll.clientHeight;
+  if (maxP <= 0) return;
+  const ratio = previewScroll.scrollTop / maxP;
+  const maxE = editor.scrollHeight - editor.clientHeight;
+  if (maxE <= 0) return;
+  isSyncingScroll = true;
+  editor.scrollTop = ratio * maxE;
+  editorHighlight.scrollTop = ratio * maxE;
+  if (lineNumbersEl) lineNumbersEl.scrollTop = ratio * maxE;
+  requestAnimationFrame(() => { isSyncingScroll = false; });
+}
+previewScroll.addEventListener('scroll', syncEditorScrollFromPreview);
 
 // =========================================================================
 // IPC + KEYBOARD
@@ -971,10 +1616,10 @@ ipcRenderer.on('file-loaded', (_e, { filePath, content }) => {
     return;
   }
   // Reuse the active tab ONLY if it's an untouched Untitled tab (no file path
-  // AND no edits). Once a tab has a file path, opening another file creates a
-  // new tab instead of replacing it.
+  // AND no edits AND not Home). Home isn't a document and Untitled-N with
+  // edits should preserve its work.
   const t = activeTab();
-  if (t && !t.filePath && !t.isModified) {
+  if (t && !isHomeTab(t) && !t.filePath && !t.isModified) {
     t.filePath = filePath;
     t.title = filePath.split(/[\\/]/).pop();
     t.content = content;
@@ -1013,28 +1658,75 @@ ipcRenderer.on('add-tab', (_e, tabData) => {
     tab.isModified = true;
     renderTabBar();
   }
+  if (tabData.backupId) tab.backupId = tabData.backupId;
   notifyTabList();
 });
 
-// New window can be opened with a set of tabs pre-loaded (used by detach).
+// New window can be opened with a set of tabs pre-loaded (used by detach
+// across windows, and by crash recovery at app startup).
 ipcRenderer.on('init-tabs', (_e, initial) => {
   if (!Array.isArray(initial) || initial.length === 0) return;
   tabs.length = 0;
   activeTabId = null;
+  ensureHomeTab();
   initial.forEach(t => {
-    const tab = makeTab({ filePath: t.filePath, content: t.content || '' });
+    const tab = makeTab({ filePath: t.filePath, content: t.content || '', title: t.title || null });
     tab.isModified = !!t.isModified;
+    if (t.backupId) tab.backupId = t.backupId;
     tabs.push(tab);
   });
-  activeTabId = tabs[0].id;
+  const firstDoc = documentTabs()[0];
+  if (!firstDoc) {
+    // Shouldn't happen — init-tabs is only sent with a non-empty list — but
+    // be defensive and land on Home.
+    activeTabId = HOME_TAB_ID;
+    document.body.classList.add('home-active');
+    filepathEl.textContent = 'Home';
+    renderTabBar();
+    renderHome();
+    notifyTabList();
+    return;
+  }
+  activeTabId = firstDoc.id;
+  document.body.classList.remove('home-active');
   isSwitchingTab = true;
-  editor.value = tabs[0].content;
+  editor.value = firstDoc.content;
   isSwitchingTab = false;
-  filepathEl.textContent = tabs[0].filePath || tabs[0].title;
-  statusEl.textContent = tabs[0].isModified ? '• unsaved' : '';
+  filepathEl.textContent = firstDoc.filePath || firstDoc.title;
+  statusEl.textContent = firstDoc.isModified ? '• unsaved' : '';
   renderTabBar();
   notifyTabList();
   render();
+});
+
+// Window-close coordinator. Main intercepts the close event and asks us to
+// walk every dirty tab with a Save / Don't Save / Cancel dialog. We commit
+// the user's choices before signaling main to actually close. Reentry guard
+// keeps a spammed close button from launching multiple walkers in parallel.
+let closeWalkInProgress = false;
+async function prepareForClose() {
+  const dirty = tabs.filter(t => t.isModified);
+  for (const tab of dirty) {
+    switchToTab(tab.id);
+    const choice = await ipcRenderer.invoke('confirm-save-discard-cancel', { title: tab.title });
+    if (choice === 'cancel') return false;
+    if (choice === 'save') {
+      const ok = await saveCurrent();
+      if (!ok) return false; // user canceled Save As, or write failed
+    } else {
+      // 'discard' — drop the backup so it doesn't reappear next launch
+      clearBackup(tab);
+      tab.isModified = false;
+    }
+  }
+  return true;
+}
+ipcRenderer.on('attempt-window-close', async () => {
+  if (closeWalkInProgress) return;
+  closeWalkInProgress = true;
+  let ok = false;
+  try { ok = await prepareForClose(); } finally { closeWalkInProgress = false; }
+  ipcRenderer.send('window-close-decision', ok);
 });
 
 ipcRenderer.on('toggle-editor', () => {
@@ -1062,28 +1754,34 @@ ipcRenderer.on('menu-replace', () => openFind(true));
 
 async function saveCurrent() {
   const t = activeTab();
-  if (!t) return;
+  if (!t || isHomeTab(t)) return false;
   let filePath = t.filePath;
   const isNewPath = !filePath;
   if (!filePath) {
     filePath = await ipcRenderer.invoke('save-as-dialog', { suggestedName: t.title });
-    if (!filePath) return;
+    if (!filePath) return false;
     t.filePath = filePath;
     t.title = filePath.split(/[\\/]/).pop();
     filepathEl.textContent = filePath;
   }
-  await ipcRenderer.invoke('save-file', { filePath, content: editor.value });
+  try {
+    await ipcRenderer.invoke('save-file', { filePath, content: editor.value });
+  } catch (_e) {
+    return false;
+  }
   t.isModified = false;
+  clearBackup(t);
   renderTabBar();
   if (isNewPath) notifyTabList();
   statusEl.textContent = 'saved';
   setTimeout(() => { statusEl.textContent = ''; }, 1500);
+  return true;
 }
 ipcRenderer.on('menu-save', saveCurrent);
 
 ipcRenderer.on('menu-save-as', async () => {
   const t = activeTab();
-  if (!t) return;
+  if (!t || isHomeTab(t)) return;
   const filePath = await ipcRenderer.invoke('save-as-dialog', { suggestedName: t.title });
   if (!filePath) return;
   t.filePath = filePath;
@@ -1091,6 +1789,7 @@ ipcRenderer.on('menu-save-as', async () => {
   filepathEl.textContent = filePath;
   await ipcRenderer.invoke('save-file', { filePath, content: editor.value });
   t.isModified = false;
+  clearBackup(t);
   renderTabBar();
   notifyTabList();
   statusEl.textContent = 'saved';
@@ -1124,6 +1823,15 @@ document.addEventListener('keydown', (e) => {
   } else if (mod && e.key === 'Tab') {
     e.preventDefault();
     cycleTab(e.shiftKey ? -1 : 1);
+  } else if (mod && !e.shiftKey && !e.altKey && k === 'b' && document.activeElement === editor) {
+    e.preventDefault();
+    applyFormat('bold');
+  } else if (mod && !e.shiftKey && !e.altKey && k === 'i' && document.activeElement === editor) {
+    e.preventDefault();
+    applyFormat('italic');
+  } else if (mod && !e.shiftKey && !e.altKey && k === 'u' && document.activeElement === editor) {
+    e.preventDefault();
+    applyFormat('underline');
   } else if (e.key === 'Escape') {
     if (activeInsertMenu) closeActiveInsertMenu();
     else if (activePopover) closeActivePopover();
@@ -1135,13 +1843,33 @@ document.addEventListener('keydown', (e) => {
 // TAB BAR + TAB OPERATIONS
 // =========================================================================
 
+function isFavoritePath(filePath) {
+  if (!filePath) return false;
+  const want = filePath.toLowerCase();
+  return settings.favorites.some(f => (f.path || '').toLowerCase() === want);
+}
+
 function renderTabBar() {
   tabBar.innerHTML = '';
   tabs.forEach(tab => {
     const el = document.createElement('div');
     el.className = 'tab' + (tab.id === activeTabId ? ' active' : '');
+    if (isHomeTab(tab)) el.classList.add('tab-home');
     el.dataset.tabId = tab.id;
     el.title = tab.filePath || tab.title;
+
+    if (isHomeTab(tab)) {
+      const icon = document.createElement('span');
+      icon.className = 'tab-home-icon';
+      icon.textContent = '⌂';
+      el.appendChild(icon);
+      const title = document.createElement('span');
+      title.className = 'tab-title';
+      title.textContent = 'Home';
+      el.appendChild(title);
+      tabBar.appendChild(el);
+      return;
+    }
 
     if (tab.isModified) {
       const dot = document.createElement('span');
@@ -1152,6 +1880,22 @@ function renderTabBar() {
     title.className = 'tab-title';
     title.textContent = tab.title;
     el.appendChild(title);
+
+    // Star toggle — appears only when the tab has a saved file path.
+    if (tab.filePath) {
+      const star = document.createElement('button');
+      star.className = 'tab-fav-btn';
+      const isFav = isFavoritePath(tab.filePath);
+      star.classList.toggle('active', isFav);
+      star.textContent = isFav ? '★' : '☆';
+      star.title = isFav ? 'Remove from Favorites' : 'Add to Favorites';
+      star.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (isFav) ipcRenderer.invoke('favorites-remove', tab.filePath);
+        else ipcRenderer.invoke('favorites-add', tab.filePath);
+      });
+      el.appendChild(star);
+    }
 
     const close = document.createElement('button');
     close.className = 'tab-close';
@@ -1182,6 +1926,7 @@ function markDirty() {
     renderTabBar();
   }
   statusEl.textContent = '• unsaved';
+  scheduleBackup(t);
 }
 
 function createNewTab(opts = {}) {
@@ -1197,8 +1942,8 @@ function switchToTab(tabId) {
     renderTabBar();
     return;
   }
-  // Save outgoing tab's state
-  if (activeTabId) {
+  // Save outgoing tab's state (skip home — it has no editable state)
+  if (activeTabId && !isHomeTabId(activeTabId)) {
     const cur = activeTab();
     if (cur) {
       cur.content = editor.value;
@@ -1217,6 +1962,17 @@ function switchToTab(tabId) {
   if (!next) return;
   activeTabId = tabId;
 
+  // Home swaps the document UI out for the Home view.
+  if (isHomeTab(next)) {
+    document.body.classList.add('home-active');
+    filepathEl.textContent = 'Home';
+    statusEl.textContent = '';
+    renderTabBar();
+    renderHome();
+    return;
+  }
+  document.body.classList.remove('home-active');
+
   isSwitchingTab = true;
   editor.value = next.content;
   isSwitchingTab = false;
@@ -1230,10 +1986,13 @@ function switchToTab(tabId) {
     editorHighlight.scrollTop = next.scrollTop;
     try { editor.setSelectionRange(next.selStart, next.selEnd); } catch (_e) {}
     previewScroll.scrollTop = next.previewScrollTop;
+    updateLineNumbers();
   });
 }
 
 async function closeTab(tabId) {
+  // Home is non-closable. Ctrl+W on Home is a no-op.
+  if (isHomeTabId(tabId)) return;
   const idx = tabs.findIndex(t => t.id === tabId);
   if (idx < 0) return;
   const tab = tabs[idx];
@@ -1245,29 +2004,48 @@ async function closeTab(tabId) {
     if (!ok) return;
   }
 
+  clearBackup(tab);
   tabs.splice(idx, 1);
   notifyTabList();
 
-  if (tabs.length === 0) {
-    // Close the window when the last tab goes away.
-    ipcRenderer.invoke('close-window');
+  // Home is always present. If no document tabs remain, switch to Home rather
+  // than closing the window.
+  if (documentTabs().length === 0) {
+    if (tab.id === activeTabId) {
+      activeTabId = null;
+      switchToTab(HOME_TAB_ID);
+    } else {
+      renderTabBar();
+    }
     return;
   }
   if (tab.id === activeTabId) {
     activeTabId = null;
+    // Pick the document tab that took our spot, or the previous one. Clamp
+    // to documentTabs since Home occupies index 0.
     const newIdx = Math.min(idx, tabs.length - 1);
-    switchToTab(tabs[newIdx].id);
+    const candidate = tabs[newIdx];
+    switchToTab(isHomeTab(candidate) ? documentTabs()[0].id : candidate.id);
   } else {
     renderTabBar();
   }
 }
 
 function cycleTab(dir) {
-  if (tabs.length < 2) return;
-  const idx = tabs.findIndex(t => t.id === activeTabId);
-  const len = tabs.length;
-  const newIdx = ((idx + dir) % len + len) % len;
-  switchToTab(tabs[newIdx].id);
+  // Cycle only within document tabs — Ctrl+Tab shouldn't drop the user onto
+  // Home unless they have no documents open.
+  const docs = documentTabs();
+  if (docs.length === 0) {
+    switchToTab(HOME_TAB_ID);
+    return;
+  }
+  if (docs.length < 2 && !isHomeTabId(activeTabId)) return;
+  const idx = docs.findIndex(t => t.id === activeTabId);
+  const len = docs.length;
+  // From Home, dir=+1 goes to first document; dir=-1 goes to last.
+  const startIdx = idx < 0 ? (dir > 0 ? -1 : 0) : idx;
+  const newIdx = ((startIdx + dir) % len + len) % len;
+  switchToTab(docs[newIdx].id);
 }
 
 // Tab body clicks → switch. We use a short time-window flag set when a drag
@@ -1319,8 +2097,11 @@ tabBar.addEventListener('pointerdown', (e) => {
   if (e.button !== 0) return;
   if (e.target.closest('.tab-close')) return;
   if (e.target.closest('.tab-add')) return;
+  if (e.target.closest('.tab-fav-btn')) return;
   const tabEl = e.target.closest('.tab');
   if (!tabEl) return;
+  // Home is non-draggable — no detach, no reorder.
+  if (tabEl.classList.contains('tab-home')) return;
 
   // Stale leftover from a previous interaction? Wipe it.
   if (dragState) cleanupDrag();
@@ -1411,6 +2192,8 @@ document.addEventListener('pointerup', async (e) => {
       let toIdx = tabs.findIndex(t => t.id === target.dataset.tabId);
       const rect = target.getBoundingClientRect();
       if (e.clientX >= rect.left + rect.width / 2) toIdx++;
+      // Keep Home pinned at index 0 — clamp the drop position.
+      if (toIdx < 1) toIdx = 1;
       tabs.splice(toIdx, 0, dragged);
       renderTabBar();
     }
@@ -1454,25 +2237,38 @@ async function detachTabToNewWindow(tabId, screenX, screenY) {
 
   // Ask main to route the tab: into another window if the cursor was over one,
   // otherwise into a fresh new window.
+  // Flush any pending backup write so the new window can resume from a
+  // consistent file rather than racing with the debounced writer.
+  const pending = backupTimers.get(tab.id);
+  if (pending) clearTimeout(pending);
+  backupTimers.delete(tab.id);
   const routed = await ipcRenderer.invoke('detach-tab', {
     tab: {
       filePath: tab.filePath,
       content: tab.content,
       isModified: tab.isModified,
+      backupId: tab.backupId, // carries ownership of the backup to the new window
     },
     screenX, screenY,
   });
   if (!routed) return; // main didn't accept (shouldn't happen, but be safe)
 
+  // NOTE: do NOT clearBackup() here — the receiving window now owns it.
   tabs.splice(idx, 1);
   notifyTabList();
-  if (tabs.length === 0) {
-    ipcRenderer.invoke('close-window');
+  if (documentTabs().length === 0) {
+    if (tab.id === activeTabId) {
+      activeTabId = null;
+      switchToTab(HOME_TAB_ID);
+    } else {
+      renderTabBar();
+    }
     return;
   }
   if (tab.id === activeTabId) {
     activeTabId = null;
-    switchToTab(tabs[Math.min(idx, tabs.length - 1)].id);
+    const candidate = tabs[Math.min(idx, tabs.length - 1)];
+    switchToTab(isHomeTab(candidate) ? documentTabs()[0].id : candidate.id);
   } else {
     renderTabBar();
   }
@@ -1589,12 +2385,50 @@ graph LR
 > Open a file with **Ctrl+O**. Toggle the editor pane with **Ctrl+E**. Save with **Ctrl+S**.
 `;
 
-// Seed the first tab. If sample-on-startup is off, the tab is just an empty Untitled.
+// Pull persisted settings from main and apply view modes/reading mode/etc.
+// before any rendering so the user never sees a flash of the wrong layout.
+async function bootstrapSettings() {
+  try {
+    const s = await ipcRenderer.invoke('settings-get');
+    if (s) {
+      Object.assign(settings, {
+        viewMode: s.viewMode || 'both',
+        readingMode: !!s.readingMode,
+        scrollSync: !!s.scrollSync,
+        lineNumbers: !!s.lineNumbers,
+        recents: s.recents || [],
+        favorites: s.favorites || [],
+      });
+    }
+  } catch (_e) {}
+  applyAllViewSettings();
+  // Tabs may have been seeded via init-tabs IPC by now — re-render so star
+  // states match the just-loaded favorites list.
+  renderTabBar();
+  refreshHomeIfVisible();
+}
+
+ensureHomeTab();
+
+// Sample doc is only created if the user has it enabled AND no other tabs
+// were seeded (init-tabs / file-loaded would push their own).
 const loadSample = localStorage.getItem('loadSample') !== 'off';
-const seedTab = makeTab({ content: loadSample ? sample : '' });
-tabs.push(seedTab);
-activeTabId = seedTab.id;
-editor.value = seedTab.content;
-filepathEl.textContent = seedTab.title;
-renderTabBar();
-render();
+if (loadSample) {
+  const seedTab = makeTab({ content: sample });
+  tabs.push(seedTab);
+  activeTabId = seedTab.id;
+  editor.value = seedTab.content;
+  filepathEl.textContent = seedTab.title;
+  document.body.classList.remove('home-active');
+  renderTabBar();
+  render();
+} else {
+  // No sample — show Home as the active tab.
+  activeTabId = HOME_TAB_ID;
+  document.body.classList.add('home-active');
+  filepathEl.textContent = 'Home';
+  renderTabBar();
+  renderHome();
+}
+
+bootstrapSettings();

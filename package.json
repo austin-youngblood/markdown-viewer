@@ -1,6 +1,6 @@
 {
   "name": "markdown-viewer",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "Live-preview Markdown viewer with GFM, syntax highlighting, math, and Mermaid",
   "main": "src/main.js",
   "author": "Austin <austin@graphiccomponents.com>",
