@@ -1416,11 +1416,46 @@ function handleEnterKey(shifted) {
 
   // Empty list item (marker but no text content) → strip the marker so the
   // next Enter on a fresh marker exits the list cleanly.
+  //
+  // Two things to be careful about here:
+  //   1. execCommand('insertText', false, '') on a range selection is not
+  //      reliable in Chromium — some builds treat it as a no-op that
+  //      returns false, which routes applyEdit through its `editor.value = X`
+  //      fallback, and setting `.value` in Chromium clamps the caret to
+  //      the new length (i.e. to the *end* of the document, not lineStart).
+  //      Use execCommand('delete') instead — canonical for range deletion,
+  //      preserves undo, and lands the caret at the start of the deleted
+  //      range deterministically.
+  //   2. This edit shrinks the document. When the async render() replaces
+  //      preview.innerHTML, the browser can clamp previewScroll.scrollTop
+  //      to match the new (shorter) content, which fires a scroll event on
+  //      previewScroll. If scroll-sync is on, that would yank the editor
+  //      scroll — producing the "cursor jumped to the top of the doc"
+  //      symptom. Suppress the sync across the render and pin the editor's
+  //      scroll position explicitly.
   if (parsed.content.length === 0) {
-    applyEdit(lineStart, lineEnd, '');
+    const savedScroll = editor.scrollTop;
+    editor.focus();
+    editor.setSelectionRange(lineStart, lineEnd);
+    const ok = document.execCommand('delete');
+    if (!ok) {
+      editor.value = editor.value.slice(0, lineStart) + editor.value.slice(lineEnd);
+      invalidateEditorLineMetrics();
+    }
     editor.setSelectionRange(lineStart, lineStart);
+    editor.scrollTop = savedScroll;
+    editorHighlight.scrollTop = savedScroll;
+    if (lineNumbersEl) lineNumbersEl.scrollTop = savedScroll;
+    clearTimeout(renderTimer);
+    isSyncingScroll = true;
     markDirty();
-    render();
+    updateLineNumbers();
+    render().then(() => {
+      editor.scrollTop = savedScroll;
+      editorHighlight.scrollTop = savedScroll;
+      if (lineNumbersEl) lineNumbersEl.scrollTop = savedScroll;
+      requestAnimationFrame(() => { isSyncingScroll = false; });
+    });
     return true;
   }
 
